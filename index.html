@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Live Invert Camera — Debugged</title>
+  <style>
+    :root { --bg:#0b0b0b; --fg:#f5f5f5; --muted:#999; --accent:#4f8cff; --warn:#ffb86b; --err:#ff6b6b; }
+    * { box-sizing: border-box; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family:system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    .app { display:grid; grid-template-rows: 1fr auto; height:100%; }
+    .stage { position:relative; overflow:hidden; background:#000; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    .hud { position:absolute; left:0; right:0; top:0; display:flex; justify-content:center; align-items:flex-start; padding:12px; gap:8px; color:var(--muted); pointer-events:none; }
+    .hud .msg { background:rgba(0,0,0,0.6); padding:8px 12px; border-radius:10px; pointer-events:auto; }
+    .controls { display:grid; grid-template-columns: repeat(5, 1fr); gap:.6rem; padding:.9rem; background: rgba(20,20,20,.9); backdrop-filter: blur(8px); }
+    button, select { appearance:none; border:0; border-radius:12px; padding:.7rem .6rem; font-weight:600; color:var(--fg); background:#1c1c1f; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+    button:active { transform: translateY(1px); }
+    .primary { background:var(--accent); color:white; }
+    .toggle[aria-pressed="true"] { background:#27ae60; }
+    .toggle[aria-pressed="false"] { background:#6b7280; }
+    .note { text-align:center; font-size:.9rem; color:var(--muted); padding:.4rem .9rem .9rem; }
+    .chip { display:inline-block; padding:.15rem .5rem; border-radius:999px; background:#222; color:#ddd; font-size:.8rem; margin-left:.3rem; }
+    .status { font-size:.85rem; color:var(--muted); }
+    .error { color:var(--err); font-weight:700; }
+    .warning { color:var(--warn); font-weight:700; }
+    .device-select { min-width:120px; }
+    .help { padding:.85rem; font-size:.9rem; color:var(--muted); }
+    .overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+    .error-panel { pointer-events:auto; background:rgba(0,0,0,0.78); color:var(--fg); border-radius:14px; padding:14px; max-width:92%; text-align:left; }
+    .error-panel p { margin:8px 0; }
+    .small { font-size:.85rem; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <div class="stage" id="stage">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="canvas" hidden></canvas>
+
+      <div class="hud" id="hud">
+        <div class="msg" id="hudMsg">Tap <strong>Start</strong> to grant camera access</div>
+      </div>
+
+      <div class="overlay" id="overlay" style="display:none">
+        <div class="error-panel" id="errorPanel" role="alert"></div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="startBtn" class="primary">Start</button>
+      <button id="retryBtn">Retry</button>
+      <select id="deviceSelect" class="device-select" title="Choose camera" aria-label="Choose camera">
+        <option value="">Auto (prefer back)</option>
+      </select>
+      <button id="flipBtn" title="Flip camera">Flip</button>
+      <button id="invertBtn" class="toggle" aria-pressed="true" title="Toggle invert filter">Invert: On</button>
+    </div>
+
+    <div class="note">
+      Point at inverted/negative photographs and the app will show them normalized. If you see <span class="chip">NotAllowedError</span>, open this page over <strong>HTTPS</strong> (or use <em>localhost</em>) and grant the camera permission in your browser settings.
+    </div>
+  </div>
+
+  <script>
+  (function(){
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const hudMsg = document.getElementById('hudMsg');
+    const startBtn = document.getElementById('startBtn');
+    const retryBtn = document.getElementById('retryBtn');
+    const flipBtn = document.getElementById('flipBtn');
+    const invertBtn = document.getElementById('invertBtn');
+    const deviceSelect = document.getElementById('deviceSelect');
+    const overlay = document.getElementById('overlay');
+    const errorPanel = document.getElementById('errorPanel');
+
+    let stream = null;
+    let rafId = null;
+    let usingCanvasPipeline = false;
+    let invertOn = true;
+    let preferredFacing = 'environment'; // 'user' or 'environment'
+
+    const isSecureContext = (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1');
+
+    function showHud(text, opts={}){
+      hudMsg.innerHTML = text;
+      if (opts.warn) hudMsg.style.color = 'var(--warn)';
+      else if (opts.error) hudMsg.style.color = 'var(--err)';
+      else hudMsg.style.color = 'var(--muted)';
+    }
+
+    function showErrorPanel(title, message, extraHtml=''){
+      overlay.style.display = 'flex';
+      errorPanel.innerHTML = `<strong>${title}</strong><p>${message}</p>${extraHtml}`;
+    }
+
+    function hideErrorPanel(){ overlay.style.display = 'none'; errorPanel.innerHTML = ''; }
+
+    function updateVisualPipeline(){
+      // Prefer CSS filter where supported — very fast and low-energy on mobile
+      try{
+        if (invertOn && CSS && CSS.supports && CSS.supports('filter', 'invert(1)')){
+          usingCanvasPipeline = false;
+          canvas.hidden = true;
+          video.style.filter = 'invert(1)';
+          cancelCanvasLoop();
+        } else if (invertOn){
+          usingCanvasPipeline = true;
+          video.style.filter = '';
+          canvas.hidden = false;
+          startCanvasLoop();
+        } else {
+          usingCanvasPipeline = false;
+          video.style.filter = '';
+          canvas.hidden = true;
+          cancelCanvasLoop();
+        }
+        invertBtn.setAttribute('aria-pressed', invertOn ? 'true' : 'false');
+        invertBtn.textContent = `Invert: ${invertOn ? 'On' : 'Off'}`;
+      }catch(e){ console.warn('updateVisualPipeline failed', e); }
+    }
+
+    function startCanvasLoop(){
+      if (!stream) return;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      function draw(){
+        if (!stream) return;
+        const vw = video.videoWidth || 640;
+        const vh = video.videoHeight || 480;
+        if (canvas.width !== vw || canvas.height !== vh){ canvas.width = vw; canvas.height = vh; }
+        try{
+          ctx.drawImage(video, 0, 0, vw, vh);
+          const img = ctx.getImageData(0,0,vw,vh);
+          const data = img.data;
+          for (let i=0;i<data.length;i+=4){
+            data[i] = 255 - data[i];
+            data[i+1] = 255 - data[i+1];
+            data[i+2] = 255 - data[i+2];
+          }
+          ctx.putImageData(img,0,0);
+        }catch(err){
+          // drawing may fail if video not ready; stop loop to avoid hogging
+          console.warn('Canvas draw error', err);
+          cancelAnimationFrame(rafId);
+          rafId = null;
+          return;
+        }
+        rafId = requestAnimationFrame(draw);
+      }
+      cancelCanvasLoop();
+      draw();
+    }
+
+    function cancelAnimationFrameSafe(id){ if (id) cancelAnimationFrame(id); }
+    function cancelCanvasLoop(){ if (rafId) cancelAnimationFrame(rafId); rafId = null; }
+
+    async function listVideoInputs(){
+      deviceSelect.innerHTML = '<option value="">Auto (prefer back)</option>';
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+      try{
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const cams = devices.filter(d => d.kind === 'videoinput');
+        cams.forEach((c, i) => {
+          const label = c.label || `Camera ${i+1}`;
+          const opt = document.createElement('option');
+          opt.value = c.deviceId;
+          opt.textContent = label;
+          deviceSelect.appendChild(opt);
+        });
+      }catch(err){ console.warn('enumerateDevices failed', err); }
+    }
+
+    async function startCamera(deviceId = ''){
+      hideErrorPanel();
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+        showErrorPanel('Not supported', 'Your browser does not support camera access via getUserMedia. Use a modern browser (Chrome, Safari, Firefox) on mobile or desktop.');
+        return;
+      }
+
+      if (!isSecureContext){
+        showErrorPanel('Insecure context', `This page is not served over HTTPS. Most browsers block camera access on insecure pages. Open this page over HTTPS or run it on <strong>localhost</strong>.`,
+          `<p class="small">Hint: on your development machine run <code>npx http-server -S -C cert.pem</code> or use a local dev server that provides HTTPS, or open the file on <strong>http://localhost</strong>.</p>`);
+        // still allow user to try (some browsers have exceptions), so continue
+      }
+
+      showHud('Requesting camera permission...');
+
+      const constraints = { audio: false, video: {} };
+      if (deviceId){
+        constraints.video.deviceId = { exact: deviceId };
+      }else{
+        // prefer environment/back camera
+        constraints.video.facingMode = { ideal: preferredFacing };
+      }
+      // Request reasonable resolution but allow fallback
+      constraints.video.width = { ideal: 1280 };
+      constraints.video.height = { ideal: 720 };
+
+      try{
+        // stop any previous stream
+        if (stream) stopCamera();
+
+        const s = await navigator.mediaDevices.getUserMedia(constraints);
+        await attachStream(s);
+        showHud('Camera active');
+        await listVideoInputs(); // refresh device labels (will populate after permission)
+        updateVisualPipeline();
+        hideErrorPanel();
+      }catch(err){
+        console.error('getUserMedia error', err);
+        handleGetUserMediaError(err, deviceId);
+      }
+    }
+
+    async function attachStream(s){
+      try{
+        stopCamera();
+      }catch(e){}
+      stream = s;
+      video.srcObject = stream;
+      try{ await video.play(); }catch(e){ console.warn('video.play failed', e); }
+    }
+
+    function stopCamera(){
+      cancelCanvasLoop();
+      if (stream){
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+    }
+
+    function handleGetUserMediaError(err, attemptedDeviceId){
+      // Friendly, actionable messages for common errors
+      const name = err && err.name ? err.name : (err && err.message ? err.message : 'UnknownError');
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError'){
+        showHud('Permission denied', { error:true });
+        const steps = [`You denied camera access or your browser blocked it.`,
+              `If you're on mobile, check browser site settings and allow "Camera" for this site.`,
+              `Ensure the page is served over HTTPS (or open on localhost).`];
+        const platformTips = getPlatformTips();
+        showErrorPanel('Camera permission blocked', `<p class="small">${steps.join('<br>')}</p>${platformTips}`,
+          `<p class="small">Actions: <button id=errorRetry class="primary">Retry</button> <button id=errorHelp>How to enable</button></p>`);
+
+        // attach event listeners to the dynamic buttons
+        setTimeout(()=>{
+          const retry = document.getElementById('errorRetry');
+          if (retry) retry.addEventListener('click', ()=>{ startCamera(attemptedDeviceId); });
+          const help = document.getElementById('errorHelp');
+          if (help) help.addEventListener('click', ()=>{ openPermissionHelp(); });
+        }, 50);
+      }else if (name === 'NotFoundError' || name === 'DevicesNotFoundError'){
+        showHud('No camera found', { error:true });
+        showErrorPanel('No camera', 'No camera devices were found on this device. If you are on a desktop, try connecting a webcam.');
+      }else if (name === 'OverconstrainedError'){
+        // try without deviceId constraint
+        if (attemptedDeviceId){
+          showHud('Device not available, trying default...');
+          startCamera('');
+        }else{
+          showErrorPanel('Constraint error', 'Requested camera constraints could not be satisfied.');
+        }
+      }else if (name === 'NotReadableError' || name === 'TrackStartError'){
+        showErrorPanel('Camera in use', 'Another application or tab is using the camera. Close other apps and try again.');
+      }else if (name === 'SecurityError'){
+        showErrorPanel('Security error', 'Camera access was blocked due to a security restriction (often insecure origin). Use HTTPS or localhost.');
+      }else{
+        showErrorPanel('Camera error', `(${name}) ${err.message || ''}`);
+      }
+    }
+
+    function getPlatformTips(){
+      const ua = navigator.userAgent || '';
+      let tips = '<p class="small">Platform-specific tips:</p><ul class="small">';
+      if (/android/i.test(ua)){
+        tips += '<li>Android Chrome: Tap the lock icon in the address bar → Site settings → Camera → Allow.</li>';
+      }
+      if (/iphone|ipad|ipod/i.test(ua)){
+        tips += '<li>iOS Safari: Open Settings → Safari → Camera and allow access for this site (you may need to open the site in Safari).</li>';
+      }
+      tips += '<li>Desktop Chrome: Settings → Privacy and security → Site settings → Camera.</li>';
+      tips += '</ul>';
+      return tips;
+    }
+
+    function openPermissionHelp(){
+      const helpHtml = `<p class="small">If you previously denied permission, you'll need to open your browser's site settings to re-enable the camera for this site. For many browsers you can click the lock icon in the address bar, or go to Site Settings in browser preferences.</p>`;
+      showErrorPanel('How to re-enable camera', helpHtml);
+    }
+
+    // UI wiring
+    startBtn.addEventListener('click', async ()=>{
+      await startCamera(deviceSelect.value || '');
+    });
+
+    retryBtn.addEventListener('click', async ()=>{
+      await startCamera(deviceSelect.value || '');
+    });
+
+    invertBtn.addEventListener('click', ()=>{ invertOn = !invertOn; updateVisualPipeline(); });
+
+    flipBtn.addEventListener('click', async ()=>{
+      // If device list populated, choose the next one
+      const opts = Array.from(deviceSelect.options).filter(o=>o.value);
+      if (opts.length > 1){
+        const current = deviceSelect.value;
+        const idx = opts.findIndex(o=>o.value === current);
+        const next = opts[(idx+1) % opts.length];
+        deviceSelect.value = next.value;
+        await startCamera(next.value);
+        return;
+      }
+      // toggle facing preference and restart
+      preferredFacing = (preferredFacing === 'environment') ? 'user' : 'environment';
+      await startCamera('');
+    });
+
+    deviceSelect.addEventListener('change', async ()=>{
+      await startCamera(deviceSelect.value || '');
+    });
+
+    // Visibility handling
+    document.addEventListener('visibilitychange', ()=>{
+      if (document.hidden){
+        cancelCanvasLoop();
+      }else{
+        if (usingCanvasPipeline && stream) startCanvasLoop();
+      }
+    });
+
+    // If permissions were previously granted, don't auto-start on insecure origin — let user decide
+    (async function init(){
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices){
+        await listVideoInputs();
+      }
+
+      // Show clear message if insecure
+      if (!isSecureContext){
+        showHud('Warning: page not served over HTTPS — camera may be blocked.');
+      }
+
+      // If permission already granted, offer to start automatically (but still require user gesture in many browsers)
+      try{
+        if (navigator.permissions && navigator.permissions.query){
+          const p = await navigator.permissions.query({ name: 'camera' }).catch(()=>null);
+          if (p && p.state === 'granted'){
+            showHud('Camera permission already granted. Tap Start to open the camera.');
+          }
+        }
+      }catch(e){ /* some browsers don't support querying 'camera' */ }
+    })();
+
+    // Clean up before unload
+    window.addEventListener('pagehide', ()=>{ stopCamera(); });
+    window.addEventListener('unload', ()=>{ stopCamera(); });
+
+    // Expose a debug button via long-press on the hud (useful for developers)
+    let pressTimer = null;
+    hudMsg.addEventListener('pointerdown', (e)=>{ pressTimer = setTimeout(()=>{ showErrorPanel('Debug: simulate NotAllowedError', '<p class="small">This button simulates a permission denied error for testing the UI.</p><p><button id="simDenied">Simulate Deny</button> <button id="clearSim">Close</button></p>'); setTimeout(()=>{ const b = document.getElementById('simDenied'); if (b) b.addEventListener('click', ()=>{ handleGetUserMediaError({name:'NotAllowedError', message:'Simulated'}, ''); }); const c = document.getElementById('clearSim'); if (c) c.addEventListener('click', ()=>{ hideErrorPanel(); }); },50); }, 700); });
+    hudMsg.addEventListener('pointerup', ()=>{ if (pressTimer) clearTimeout(pressTimer); });
+
+  })();
+  </script>
+</body>
+</html>
